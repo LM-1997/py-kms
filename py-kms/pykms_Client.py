@@ -4,9 +4,11 @@
 import re
 import binascii
 import datetime
+import json
 import random
 import socket
 import string
+import struct
 import sys
 import time
 import uuid
@@ -58,7 +60,8 @@ loggerclt = logging.getLogger('logclt')
 clt_options = {
         'ip'       : {'help' : 'The IP address or hostname of the KMS server.', 'def' : "::", 'des' : "ip"},
         'port'     : {'help' : 'The port the KMS service is listening on. The default is \"1688\".', 'def' : 1688, 'des' : "port"},
-        'mode'     : {'help' : 'Microsoft product family to emulate. This selects the AppId, KMS Counted Id and SKU sent in the request. \
+        'mode'     : {'help' : 'Microsoft product family(ies) to emulate, comma-separated for several families \
+(e.g. Windows10,Office2024). This selects the AppId, KMS Counted Id and SKU sent in the request. \
 The default is \"Windows10\" (Windows 11 shares the same count family).',
                       'def' : "Windows10", 'des' : "mode",
                       'choi' : ["WindowsVista","Windows7","Windows8","Windows8.1","Windows10","Windows11",
@@ -66,18 +69,26 @@ The default is \"Windows10\" (Windows 11 shares the same count family).',
                                 "WindowsServer2012","WindowsServer2012R2","WindowsServer2016","WindowsServer2019",
                                 "WindowsServer2022","WindowsServer2025",
                                 "Office2010","Office2013","Office2016","Office2019","Office2021","Office2024"]},
-        'repeat'   : {'help' : 'Number of client requests to send, each with a unique random CMID and its own connection, \
-to raise the KMS host client count. Defaults to the required count of the selected product family \
-(25 for Windows client, 5 for Windows Server / Office).',
+        'repeat'   : {'help' : 'Number of client requests to send per family (literal: no auto-stop). \
+If not given, the automatic mode runs: renew the persistent CMIDs of the family, then top up with new \
+identities until the host client count reaches the family threshold.',
                       'def' : None, 'des' : "repeat"},
+        'cmidpool' : {'help' : 'Path of the persistent CMID pool file. Reusing the same client identities across \
+runs makes re-runs act as renewals (refreshing the host 30-day count window) instead of new clients. \
+Default is \"pykms_cmid_pool.json\" in the working directory.',
+                      'def' : 'pykms_cmid_pool.json', 'des' : "cmidpool"},
+        'nocmidpool' : {'help' : 'Disable the persistent CMID pool: every request uses a fresh random CMID.',
+                      'def' : False, 'des' : "nocmidpool"},
         'cmid'     : {'help' : 'Use this flag to manually specify a CMID to use. If no CMID is specified, a random CMID will be generated.',
                       'def' : None, 'des' : "cmid"},
         'name'     : {'help' : 'Use this flag to manually specify an ASCII machine name to use. If no machine name is specified a random one \
 will be generated.', 'def' : None, 'des' : "machine"},
-        'time0'    : {'help' : 'Set the maximum time to wait for a connection attempt to KMS server to succeed. Default is no timeout.',
-                      'def' : None, 'des' : "timeoutidle"},
-        'time1'    : {'help' : 'Set the maximum time to wait for sending / receiving a request / response. Default is no timeout.',
-                      'def' : None, 'des' : "timeoutsndrcv"},
+        'time0'    : {'help' : 'Set the maximum time to wait for a connection attempt to KMS server to succeed. \
+Default is 10 seconds; 0 means no timeout.',
+                      'def' : 10, 'des' : "timeoutidle"},
+        'time1'    : {'help' : 'Set the maximum time to wait for sending / receiving a request / response. \
+Default is 30 seconds; 0 means no timeout.',
+                      'def' : 30, 'des' : "timeoutsndrcv"},
         'asyncmsg' : {'help' : 'Prints pretty / logging messages asynchronously. Deactivated by default.',
                       'def' : False, 'des' : "asyncmsg"},
         'llevel'   : {'help' : 'Use this option to set a log level. The default is \"ERROR\".', 'def' : "ERROR", 'des' : "loglevel",
@@ -97,9 +108,13 @@ def client_options():
         client_parser.add_argument("port", nargs = "?", action = "store", default = clt_options['port']['def'],
                                    help = clt_options['port']['help'], type = int)
         client_parser.add_argument("-m", "--mode", dest = clt_options['mode']['des'], default = clt_options['mode']['def'],
-                                   choices = clt_options['mode']['choi'], help = clt_options['mode']['help'], type = str)
+                                   help = clt_options['mode']['help'], type = str)
         client_parser.add_argument("-C", "--repeat", dest = clt_options['repeat']['des'], action = "store",
                                    default = clt_options['repeat']['def'], help = clt_options['repeat']['help'], type = int)
+        client_parser.add_argument("--cmid-pool", dest = clt_options['cmidpool']['des'], action = "store",
+                                   default = clt_options['cmidpool']['def'], help = clt_options['cmidpool']['help'], type = str)
+        client_parser.add_argument("--no-cmid-pool", dest = clt_options['nocmidpool']['des'], action = "store_true",
+                                   default = clt_options['nocmidpool']['def'], help = clt_options['nocmidpool']['help'])
         client_parser.add_argument("-c", "--cmid", dest = clt_options['cmid']['des'], default = clt_options['cmid']['def'],
                                    help = clt_options['cmid']['help'], type = str)
         client_parser.add_argument("-n", "--name", dest = clt_options['name']['des'] , default = clt_options['name']['def'],
@@ -172,6 +187,26 @@ def client_check():
         opts = [('timeoutidle', '-t0/--timeout-idle'),
                 ('timeoutsndrcv', '-t1/--timeout-sndrcv')]
         check_other(clt_config, opts, loggerclt, where = 'clt')
+
+        # A timeout of 0 means no timeout.
+        for opt in ('timeoutidle', 'timeoutsndrcv'):
+                if clt_config[opt] == 0:
+                        clt_config[opt] = None
+
+        # Check the (comma separated) product family list.
+        clt_config['modes'] = []
+        for mode in clt_config['mode'].split(','):
+                mode = mode.strip()
+                if not mode:
+                        continue
+                if mode not in clt_options['mode']['choi']:
+                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
+                                       put_text = "{reverse}{red}{bold}argument `-m/--mode`: unknown product family '%s'. \
+Run with -h to list the supported families. Exiting...{end}" %mode)
+                clt_config['modes'].append(mode)
+        if not clt_config['modes']:
+                pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
+                               put_text = "{reverse}{red}{bold}argument `-m/--mode`: no product family given. Exiting...{end}")
 
 def client_update():
         kmsdb = kmsDB2Dict()
@@ -268,7 +303,7 @@ def client_create(clt_sock):
                 pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
                                put_text = "{reverse}{red}{bold}While sending: %s. Exiting...{end}" %str(e))
         try:
-                bindResponse = clt_sock.recv(1024)
+                bindResponse = recv_pdu(clt_sock)
                 if bindResponse == '' or not bindResponse:
                         pretty_printer(log_obj = loggerclt.warning, to_exit = True, where = "clt",
                                        put_text = "{reverse}{yellow}{bold}No data received. Exiting...{end}")
@@ -293,7 +328,7 @@ def client_create(clt_sock):
                         pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
                                        put_text = "{reverse}{red}{bold}While sending: %s. Exiting...{end}" %str(e))
                 try:
-                        response = clt_sock.recv(1024)
+                        response = recv_pdu(clt_sock)
                         pretty_printer(num_text = [-4, 20], where = "clt")
                 except socket.error as e:
                         pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
@@ -302,15 +337,13 @@ def client_create(clt_sock):
                 loggerclt.debug("Response: \n%s\n" % justify(deco(binascii.b2a_hex(response), 'latin-1')))
                 parsed = MSRPCRespHeader(response)
                 if parsed['type'] == rpcBase.packetType['fault']:
-                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
-                                       put_text = "{reverse}{red}{bold}The KMS server refused the request (RPC fault). \
-The selected product family is probably not covered by the host's KMS key. Exiting...{end}")
+                        raise KmsFamilyError("The KMS server refused the request (RPC fault): the selected product \
+family is probably not covered by the host's KMS key")
                 try:
                         kmsData = readKmsResponse(parsed['pduData'], kmsRequest, clt_config)
                 except Exception as e:
-                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
-                                       put_text = "{reverse}{red}{bold}Failed to parse the KMS response: %s. \
-Enable DEBUG logging to inspect the raw response. Exiting...{end}" %str(e))
+                        raise KmsFamilyError("Failed to parse the KMS response (%s) - enable DEBUG logging to inspect \
+the raw response" %str(e))
                 kmsResp = kmsData['response']
                 
                 try:
@@ -329,13 +362,181 @@ Enable DEBUG logging to inspect the raw response. Exiting...{end}" %str(e))
                                                        'product' : clt_config["mode"]})
 
                 pretty_printer(num_text = 21, where = "clt")
-                
+                return kmsResp
+
         elif packetType == rpcBase.packetType['bindNak']:
                 loggerclt.info(justify(MSRPCBindNak(bindResponse).dump(print_to_stdout = False)))
-                sys.exit(0)
+                sys.exit(1)
         else:
                 pretty_printer(log_obj = loggerclt.warning, to_exit = True, where = "clt",
                                put_text = "{reverse}{magenta}{bold}Something went wrong. Exiting...{end}")
+
+class KmsFamilyError(Exception):
+        """Hard error while injecting a single product family (RPC fault, unparseable response)."""
+
+class CmidPool:
+        """Persistent pool of simulated client identities (CMID + machine name).
+
+        Reusing the same identities across runs turns re-runs into renewals
+        (refreshing the host's 30-day count window) instead of new clients.
+        """
+        def __init__(self, path, enabled = True):
+                self.path = path
+                self.enabled = enabled
+                self.entries = []
+                if self.enabled:
+                        self.load()
+
+        def load(self):
+                try:
+                        with open(self.path, 'r', encoding = 'utf-8') as f:
+                                data = json.load(f)
+                        if data.get('version') != 1 or not isinstance(data.get('entries'), list):
+                                raise ValueError('unsupported pool format')
+                        self.entries = data['entries']
+                except OSError:
+                        pass # No pool file yet: start fresh.
+                except Exception as e:
+                        try:
+                                os.replace(self.path, self.path + '.bak')
+                        except OSError:
+                                pass
+                        pretty_printer(log_obj = loggerclt.warning,
+                                       put_text = "{reverse}{yellow}{bold}CMID pool file unreadable (%s): backed up and starting fresh.{end}" %str(e))
+
+        def save(self):
+                if not self.enabled:
+                        return
+                tmp = self.path + '.tmp'
+                with open(tmp, 'w', encoding = 'utf-8') as f:
+                        json.dump({'version' : 1, 'entries' : self.entries}, f, indent = 2)
+                os.replace(tmp, self.path)
+
+        def renewal_identities(self, family):
+                """Identities already associated with `family`, least recently requested first."""
+                if not self.enabled:
+                        return []
+                assoc = [e for e in self.entries if family in e.get('families', {})]
+                assoc.sort(key = lambda e: e['families'][family])
+                return [(e['cmid'], e.get('machine')) for e in assoc]
+
+        def new_identity(self, family):
+                """An identity not yet associated with any family: reuse a spare entry, else create one."""
+                if not self.enabled:
+                        return (None, None)
+                spare = next((e for e in self.entries if not e.get('families')), None)
+                if spare is None:
+                        spare = {'cmid' : str(uuid.uuid4()),
+                                 'machine' : ''.join(random.choice(string.ascii_letters + string.digits)
+                                                     for _ in range(random.randint(8, 12))),
+                                 'families' : {}}
+                        self.entries.append(spare)
+                return (spare['cmid'], spare.get('machine'))
+
+        def record(self, cmid, machine, family):
+                if not self.enabled or cmid is None:
+                        return
+                for e in self.entries:
+                        if e['cmid'] == cmid:
+                                e.setdefault('families', {})[family] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                                if machine:
+                                        e['machine'] = machine
+                                return
+
+def recv_pdu(clt_sock):
+        """Receive one complete MS-RPC PDU: read the common header, then the rest according to frag_len."""
+        header = b''
+        while len(header) < MSRPCHeader._SIZE:
+                chunk = clt_sock.recv(MSRPCHeader._SIZE - len(header))
+                if not chunk:
+                        raise socket.error('connection closed by the KMS server')
+                header += chunk
+        frag_len = struct.unpack('<H', header[8:10])[0]
+        body = b''
+        while len(body) < frag_len - MSRPCHeader._SIZE:
+                chunk = clt_sock.recv(frag_len - MSRPCHeader._SIZE - len(body))
+                if not chunk:
+                        raise socket.error('connection closed by the KMS server')
+                body += chunk
+        return header + body
+
+def send_request(cmid, machine):
+        """Send one activation request with the given identity on a fresh connection;
+        return the host's current client count from the response."""
+        clt_config['cmid'] = cmid
+        clt_config['machine'] = machine
+        clt_sock = client_connect()
+        try:
+                kmsResp = client_create(clt_sock)
+        finally:
+                try:
+                        clt_sock.shutdown(socket.SHUT_RDWR)
+                        clt_sock.close()
+                except:
+                        pass
+        return kmsResp['currentClientCount']
+
+def inject_family(mode, pool, user_cmid, user_machine):
+        """Inject one product family: renew known identities, then top up to the threshold.
+        Returns 0 (threshold reached / all requests sent), 1 (hard family error), 2 (stalled below threshold)."""
+        clt_config['mode'] = mode
+        client_update()
+        threshold = clt_config['RequiredClientCount']
+        max_requests = 2 * threshold + 5
+        fixed = user_cmid is not None
+        sent, last_count = 0, None
+
+        def identity(cmid, machine):
+                return (user_cmid, user_machine) if fixed else (cmid, machine)
+
+        loggerclt.info("Product family: %s (AppId: %s, KMS Counted Id: %s, SKU: %s), required client count: %s" %(
+                mode, clt_config['KMSClientAppID'], clt_config['KMSClientKMSCountedID'],
+                clt_config['KMSClientSkuID'], threshold))
+
+        def do_send(cmid, machine):
+                nonlocal sent, last_count
+                count = send_request(cmid, machine)
+                sent += 1
+                last_count = count
+                if not fixed:
+                        pool.record(cmid, machine, mode)
+                loggerclt.info("Request %d sent - host client count: %s" %(sent, count))
+                time.sleep(1)
+
+        try:
+                if clt_config['repeat'] is not None:
+                        # Literal mode: exactly N requests, pool identities in renewal-first order.
+                        for cmid, machine in pool.renewal_identities(mode)[:clt_config['repeat']]:
+                                do_send(*identity(cmid, machine))
+                        while sent < clt_config['repeat']:
+                                cmid, machine = pool.new_identity(mode)
+                                do_send(*identity(cmid, machine))
+                        return 0
+
+                # Automatic mode: renew the family's known identities, then top up to the threshold.
+                for cmid, machine in pool.renewal_identities(mode)[:max_requests]:
+                        do_send(*identity(cmid, machine))
+                stall = 0
+                while (last_count is None or last_count < threshold) and sent < max_requests:
+                        prev = last_count
+                        cmid, machine = pool.new_identity(mode)
+                        do_send(*identity(cmid, machine))
+                        stall = stall + 1 if last_count == prev else 0
+                        if stall >= 3:
+                                pretty_printer(log_obj = loggerclt.error,
+                                               put_text = "{reverse}{red}{bold}The host client count is not increasing for family '%s' \
+(count %s, threshold %s): the family is probably not covered by the host's KMS key.{end}" %(mode, last_count, threshold))
+                                return 2
+                if last_count is None or last_count >= threshold:
+                        return 0
+                pretty_printer(log_obj = loggerclt.error,
+                               put_text = "{reverse}{red}{bold}Stopped after %d requests with the host client count at %s, \
+still below the threshold %s for family '%s'.{end}" %(sent, last_count, threshold, mode))
+                return 2
+        except KmsFamilyError as e:
+                pretty_printer(log_obj = loggerclt.error,
+                               put_text = "{reverse}{red}{bold}Family '%s' aborted: %s. Continuing with the next family.{end}" %(mode, str(e)))
+                return 1
 
 def clt_main():
         try:
@@ -344,42 +545,31 @@ def clt_main():
 
                 # Check options.
                 client_check()
-                # Update Config.
-                client_update()
 
-                loggerclt.info("Product family: %s (AppId: %s, KMS Counted Id: %s, SKU: %s), required client count: %s" %(
-                        clt_config['mode'], clt_config['KMSClientAppID'], clt_config['KMSClientKMSCountedID'],
-                        clt_config['KMSClientSkuID'], clt_config['RequiredClientCount']))
-
-                # Number of requests: -C/--repeat if given, else the required count of the selected family.
-                repeats = clt_config['repeat'] if clt_config['repeat'] is not None else clt_config['RequiredClientCount']
-                if repeats < 1:
-                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
-                                       put_text = "{reverse}{red}{bold}argument `-C/--repeat`: must be >= 1. Exiting...{end}")
-                if clt_config['cmid'] is not None and repeats > 1:
+                # Persistent client identities and explicit overrides.
+                pool = CmidPool(clt_config['cmidpool'], enabled = not clt_config['nocmidpool'])
+                user_cmid, user_machine = clt_config['cmid'], clt_config['machine']
+                if user_cmid is not None:
                         pretty_printer(log_obj = loggerclt.warning,
-                                       put_text = "{reverse}{yellow}{bold}A fixed CMID was given with more than one request: the host \
-counts unique CMIDs, so repeated requests will not raise its count.{end}")
+                                       put_text = "{reverse}{yellow}{bold}A fixed CMID was given: the host counts unique CMIDs, \
+so repeated requests will not raise its count.{end}")
 
-                # Create and run client: a fresh connection and a fresh random CMID for every request,
-                # so the host counts each one as a separate client.
-                for i in range(repeats):
-                        clt_sock = client_connect()
-                        client_create(clt_sock)
-                        try:
-                                clt_sock.shutdown(socket.SHUT_RDWR)
-                                clt_sock.close()
-                        except:
-                                pass
-                        loggerclt.info("Request %d of %d done." %(i + 1, repeats))
-                        if i < repeats - 1:
-                                time.sleep(1)
-        except (KeyboardInterrupt, SystemExit):
-                try:
-                        clt_sock.shutdown(socket.SHUT_RDWR)
-                        clt_sock.close()
-                except:
-                        pass
+                worst, summary = 0, []
+                for mode in clt_config['modes']:
+                        rc = inject_family(mode, pool, user_cmid, user_machine)
+                        worst = max(worst, rc)
+                        summary.append((mode, rc))
+
+                pool.save()
+
+                results = {0 : 'OK', 1 : 'ERROR', 2 : 'BELOW THRESHOLD'}
+                loggerclt.info("===== Summary =====")
+                for mode, rc in summary:
+                        loggerclt.info("Family %-26s : %s" %(mode, results[rc]))
+                loggerclt.info("Overall: %s" %results[worst])
+                sys.exit(worst)
+        except KeyboardInterrupt:
+                pass
 
 def createKmsRequestBase():
         requestDict = kmsBase.kmsRequestStruct()
