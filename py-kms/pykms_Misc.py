@@ -193,8 +193,6 @@ def logger_create(log_obj, config, mode = 'a'):
         frmt_min = '%(asctime)s %(levelname)-8s %(host)s   %(status)s   %(product)s  %(message)s'
         frmt_name = '%(name)s '
 
-        from pykms_Server import serverthread
-
         def apply_formatter(levelnum, formats, handler, color = False):
                 levelformdict = {}
                 for num in levelnum:

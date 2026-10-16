@@ -8,6 +8,7 @@ import random
 import socket
 import string
 import sys
+import time
 import uuid
 import logging
 import os
@@ -57,9 +58,17 @@ loggerclt = logging.getLogger('logclt')
 clt_options = {
         'ip'       : {'help' : 'The IP address or hostname of the KMS server.', 'def' : "::", 'des' : "ip"},
         'port'     : {'help' : 'The port the KMS service is listening on. The default is \"1688\".', 'def' : 1688, 'des' : "port"},
-        'mode'     : {'help' : 'Use this flag to manually specify a Microsoft product for testing the server. The default is \"Windows81\"',
-                      'def' : "Windows8.1", 'des' : "mode",
-                      'choi' : ["WindowsVista","Windows7","Windows8","Windows8.1","Windows10","Office2010","Office2013","Office2016","Office2019"]},
+        'mode'     : {'help' : 'Microsoft product family to emulate. This selects the AppId, KMS Counted Id and SKU sent in the request. \
+The default is \"Windows10\" (Windows 11 shares the same count family).',
+                      'def' : "Windows10", 'des' : "mode",
+                      'choi' : ["WindowsVista","Windows7","Windows8","Windows8.1","Windows10","Windows11",
+                                "WindowsServer2012","WindowsServer2012R2","WindowsServer2016","WindowsServer2019",
+                                "WindowsServer2022","WindowsServer2025",
+                                "Office2010","Office2013","Office2016","Office2019","Office2021","Office2024"]},
+        'repeat'   : {'help' : 'Number of client requests to send, each with a unique random CMID and its own connection, \
+to raise the KMS host client count. Defaults to the required count of the selected product family \
+(25 for Windows client, 5 for Windows Server / Office).',
+                      'def' : None, 'des' : "repeat"},
         'cmid'     : {'help' : 'Use this flag to manually specify a CMID to use. If no CMID is specified, a random CMID will be generated.',
                       'def' : None, 'des' : "cmid"},
         'name'     : {'help' : 'Use this flag to manually specify an ASCII machine name to use. If no machine name is specified a random one \
@@ -88,6 +97,8 @@ def client_options():
                                    help = clt_options['port']['help'], type = int)
         client_parser.add_argument("-m", "--mode", dest = clt_options['mode']['des'], default = clt_options['mode']['def'],
                                    choices = clt_options['mode']['choi'], help = clt_options['mode']['help'], type = str)
+        client_parser.add_argument("-C", "--repeat", dest = clt_options['repeat']['des'], action = "store",
+                                   default = clt_options['repeat']['def'], help = clt_options['repeat']['help'], type = int)
         client_parser.add_argument("-c", "--cmid", dest = clt_options['cmid']['des'], default = clt_options['cmid']['def'],
                                    help = clt_options['cmid']['help'], type = str)
         client_parser.add_argument("-n", "--name", dest = clt_options['name']['des'] , default = clt_options['name']['def'],
@@ -166,31 +177,48 @@ def client_update():
 
         loggerclt.debug(f'Searching in kms database for machine "{clt_config["mode"]}"...')
 
+        # Windows 11 shares the Windows 10 count family.
+        if clt_config['mode'] == 'Windows11':
+                clt_config['mode'] = 'Windows10'
+
         appitems = kmsdb[2]
         for appitem in appitems:
                 kmsitems = appitem['KmsItems']
-                for kmsitem in kmsitems:                                
+                for kmsitem in kmsitems:
+                        if kmsitem.get('IsRetail', 'false').lower() == 'true':
+                                continue # Prefer the volume sibling: real KMS clients are GVLK volume clients.
                         name = re.sub(r'\(.*\)', '', kmsitem['DisplayName']) # Remove brackets
                         name = name.replace('2015', '') # Remove specific years
                         name = name.replace(' ', '') # Ignore whitespaces
                         name = name.replace('/11', '', 1) # Cut out Windows 11, as it is basically Windows 10
                         if name == clt_config['mode']:
                                 skuitems = kmsitem['SkuItems']
-                                # Select 'Enterprise' for Windows or 'Professional Plus' for Office.
-                                for skuitem in skuitems:
-                                        sName = skuitem['DisplayName']
+                                # Select 'Enterprise' for Windows clients, 'Standard' for Windows Server,
+                                # 'Professional Plus' (or 'LTSC Professional Plus') for Office.
+                                skuitem = None
+                                for sku in skuitems:
+                                        sName = sku['DisplayName']
                                         sName = sName.replace(' ', '') # Ignore whitespaces
                                         sName = sName.replace('/11', '', 1) # Cut out Windows 11, as it is basically Windows 10
                                         if sName == name + 'Enterprise' or \
-                                           sName == name[:6] + 'ProfessionalPlus' + name[6:]:
-                                                clt_config['KMSClientSkuID'] = skuitem['Id']
-                                                clt_config['RequiredClientCount'] = int(kmsitem.get('NCountPolicy', 25)) # if not given default to 25
-                                                clt_config['KMSProtocolMajorVersion'] = int(float(kmsitem['DefaultKmsProtocol']))
-                                                clt_config['KMSProtocolMinorVersion'] = 0
-                                                clt_config['KMSClientLicenseStatus'] = 2
-                                                clt_config['KMSClientAppID'] = appitem['Id']
-                                                clt_config['KMSClientKMSCountedID'] = kmsitem['Id']
-                                                return
+                                           sName == name[:6] + 'ProfessionalPlus' + name[6:] or \
+                                           sName == name[:6] + 'LTSCProfessionalPlus' + name[6:] or \
+                                           sName == name + 'Standard' or \
+                                           sName == name + 'Datacenter':
+                                                skuitem = sku
+                                                break
+                                if skuitem is None:
+                                        # No well-known edition matched: any SKU of the family works for counting.
+                                        skuitem = skuitems[0]
+                                clt_config['KMSClientSkuID'] = skuitem['Id']
+                                clt_config['RequiredClientCount'] = int(kmsitem.get('NCountPolicy', 25)) # if not given default to 25
+                                clt_config['KMSProtocolMajorVersion'] = int(float(kmsitem.get('DefaultKmsProtocol',
+                                                                                               kmsitem.get('DefaultKmsprotocol', '6.0'))))
+                                clt_config['KMSProtocolMinorVersion'] = 0
+                                clt_config['KMSClientLicenseStatus'] = 2
+                                clt_config['KMSClientAppID'] = appitem['Id']
+                                clt_config['KMSClientKMSCountedID'] = kmsitem['Id']
+                                return
         raise RuntimeError(f'Client failed to find machine configuration in kms database - make sure it contains an entry for "{clt_config["mode"]}"')
 
 def client_connect():
@@ -305,9 +333,34 @@ def clt_main():
                 client_check()
                 # Update Config.
                 client_update()
-                # Create and run client.
-                clt_sock = client_connect()
-                client_create(clt_sock)
+
+                loggerclt.info("Product family: %s (AppId: %s, KMS Counted Id: %s, SKU: %s), required client count: %s" %(
+                        clt_config['mode'], clt_config['KMSClientAppID'], clt_config['KMSClientKMSCountedID'],
+                        clt_config['KMSClientSkuID'], clt_config['RequiredClientCount']))
+
+                # Number of requests: -C/--repeat if given, else the required count of the selected family.
+                repeats = clt_config['repeat'] if clt_config['repeat'] is not None else clt_config['RequiredClientCount']
+                if repeats < 1:
+                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
+                                       put_text = "{reverse}{red}{bold}argument `-C/--repeat`: must be >= 1. Exiting...{end}")
+                if clt_config['cmid'] is not None and repeats > 1:
+                        pretty_printer(log_obj = loggerclt.warning,
+                                       put_text = "{reverse}{yellow}{bold}A fixed CMID was given with more than one request: the host \
+counts unique CMIDs, so repeated requests will not raise its count.{end}")
+
+                # Create and run client: a fresh connection and a fresh random CMID for every request,
+                # so the host counts each one as a separate client.
+                for i in range(repeats):
+                        clt_sock = client_connect()
+                        client_create(clt_sock)
+                        try:
+                                clt_sock.shutdown(socket.SHUT_RDWR)
+                                clt_sock.close()
+                        except:
+                                pass
+                        loggerclt.info("Request %d of %d done." %(i + 1, repeats))
+                        if i < repeats - 1:
+                                time.sleep(1)
         except (KeyboardInterrupt, SystemExit):
                 try:
                         clt_sock.shutdown(socket.SHUT_RDWR)
