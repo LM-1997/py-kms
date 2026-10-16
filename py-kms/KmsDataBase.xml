@@ -712,7 +712,7 @@ You can read them using pkeyconfig-gui off MDL forums or Product Key Config. Rea
 				<SkuItem DisplayName="Office Visio Pro 2021 Preview" Id="a3b44174-2451-4cd6-b25f-66638bfb9046" Gvlk="2XYX7-NXXBK-9CK7W-K2TKW-JFJ7G" />
 			</KmsItem>
 
-			<KmsItem DisplayName="Office 2024" Id="1b4db7eb-4057-5ddf-91e0-36dec72071f5" IsPreview="false" CanMapToDefaultCsvlk="false" DefaultKmsprotocol="6.0" NCountPolicy="5">
+			<KmsItem DisplayName="Office 2024" Id="1b4db7eb-4057-5ddf-91e0-36dec72071f5" IsPreview="false" CanMapToDefaultCsvlk="false" DefaultKmsProtocol="6.0" NCountPolicy="5">
 				<SkuItem DisplayName="Office Access LTSC 2024" Id="72e9faa7-ead1-4f3d-9f6e-3abc090a81d7" Gvlk="82FTR-NCHR7-W3944-MGRHM-JMCWD" />
 				<SkuItem DisplayName="Office Excel LTSC 2024" Id="cbbba2c3-0ff5-4558-846a-043ef9d78559" Gvlk="F4DYN-89BP2-WQTWJ-GR8YC-CKGJG" />
 				<SkuItem DisplayName="Office Outlook LTSC 2024" Id="bef3152a-8a04-40f2-a065-340c3f23516d" Gvlk="D2F8D-N3Q3B-J28PV-X27HD-RJWB9" />

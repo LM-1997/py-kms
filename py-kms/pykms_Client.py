@@ -62,6 +62,7 @@ clt_options = {
 The default is \"Windows10\" (Windows 11 shares the same count family).',
                       'def' : "Windows10", 'des' : "mode",
                       'choi' : ["WindowsVista","Windows7","Windows8","Windows8.1","Windows10","Windows11",
+                                "Windows10ServerRdsh","Windows10ChinaGovernment",
                                 "WindowsServer2012","WindowsServer2012R2","WindowsServer2016","WindowsServer2019",
                                 "WindowsServer2022","WindowsServer2025",
                                 "Office2010","Office2013","Office2016","Office2019","Office2021","Office2024"]},
@@ -185,14 +186,17 @@ def client_update():
         for appitem in appitems:
                 kmsitems = appitem['KmsItems']
                 for kmsitem in kmsitems:
-                        if kmsitem.get('IsRetail', 'false').lower() == 'true':
-                                continue # Prefer the volume sibling: real KMS clients are GVLK volume clients.
+                        if kmsitem.get('IsRetail', 'false').lower() == 'true' or \
+                           kmsitem.get('IsPreview', 'false').lower() == 'true':
+                                continue # Prefer the released volume sibling: real KMS clients are GVLK volume clients.
                         name = re.sub(r'\(.*\)', '', kmsitem['DisplayName']) # Remove brackets
                         name = name.replace('2015', '') # Remove specific years
                         name = name.replace(' ', '') # Ignore whitespaces
                         name = name.replace('/11', '', 1) # Cut out Windows 11, as it is basically Windows 10
                         if name == clt_config['mode']:
                                 skuitems = kmsitem['SkuItems']
+                                if not skuitems:
+                                        continue # Placeholder family without SKUs.
                                 # Select 'Enterprise' for Windows clients, 'Standard' for Windows Server,
                                 # 'Professional Plus' (or 'LTSC Professional Plus') for Office.
                                 skuitem = None
@@ -297,7 +301,16 @@ def client_create(clt_sock):
 
                 loggerclt.debug("Response: \n%s\n" % justify(deco(binascii.b2a_hex(response), 'latin-1')))
                 parsed = MSRPCRespHeader(response)
-                kmsData = readKmsResponse(parsed['pduData'], kmsRequest, clt_config)
+                if parsed['type'] == rpcBase.packetType['fault']:
+                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
+                                       put_text = "{reverse}{red}{bold}The KMS server refused the request (RPC fault). \
+The selected product family is probably not covered by the host's KMS key. Exiting...{end}")
+                try:
+                        kmsData = readKmsResponse(parsed['pduData'], kmsRequest, clt_config)
+                except Exception as e:
+                        pretty_printer(log_obj = loggerclt.error, to_exit = True, where = "clt",
+                                       put_text = "{reverse}{red}{bold}Failed to parse the KMS response: %s. \
+Enable DEBUG logging to inspect the raw response. Exiting...{end}" %str(e))
                 kmsResp = kmsData['response']
                 
                 try:
